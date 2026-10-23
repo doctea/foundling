@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <stdint.h>
+#include <new>
 
 // Lightweight flat-array list template for generic pointers (pages, groups, outputs, etc).
 // Replaces LinkedList<T*> for small, frequently-allocated collections.
@@ -13,17 +14,27 @@ class GenericList {
     uint16_t _count = 0;
     uint16_t _capacity = 0;
 
-    void grow() {
-        uint16_t new_cap = (_capacity == 0) ? 4 : (_capacity + 4);
-        T* new_items = (T*)realloc(_items, new_cap * sizeof(T));
-        if (new_items == nullptr) return; // OOM - item will not be added
+    bool resize(uint16_t capacity) {
+        T* new_items = nullptr;
+        if (capacity > 0) {
+            new_items = new (std::nothrow) T[capacity];
+            if (new_items == nullptr) return false;
+            for (uint16_t index = 0; index < _count; ++index)
+                new_items[index] = _items[index];
+        }
+        delete[] _items;
         _items = new_items;
-        _capacity = new_cap;
+        _capacity = capacity;
+        return true;
+    }
+
+    void grow() {
+        resize((_capacity == 0) ? 4 : (_capacity + 4));
     }
 
 public:
     GenericList() = default;
-    ~GenericList() { free(_items); }
+    ~GenericList() { delete[] _items; }
 
     GenericList(const GenericList&) = delete;
     GenericList& operator=(const GenericList&) = delete;
@@ -61,14 +72,8 @@ public:
 
     // Release unused capacity after all items have been added
     void shrink_to_fit() {
-        if (_capacity > _count) {
-            if (_count == 0) {
-                free(_items); _items = nullptr; _capacity = 0;
-            } else {
-                T* new_items = (T*)realloc(_items, _count * sizeof(T));
-                if (new_items != nullptr) { _items = new_items; _capacity = _count; }
-            }
-        }
+        if (_capacity > _count)
+            resize(_count);
     }
 
     void remove(int idx) {
