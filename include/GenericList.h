@@ -8,6 +8,11 @@
 // Replaces LinkedList<T*> for small, frequently-allocated collections.
 // Supports insertion at arbitrary positions.
 // Saves ~16 bytes per item (vs 8-byte ListNode + 8-byte malloc overhead for pointer).
+
+// TODO: implement iterators
+// TODO: implement sorting
+
+
 template<typename T>
 class GenericList {
     T* _items = nullptr;
