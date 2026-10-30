@@ -70,6 +70,10 @@ public:
         return _items[idx];
     }
 
+    // Array subscript operators for array-like syntax list[i]
+    T& operator[](uint16_t idx) { return _items[idx]; }
+    const T& operator[](uint16_t idx) const { return _items[idx]; }
+
     uint16_t size() const { return _count; }
     bool empty() const { return _count == 0; }
 
