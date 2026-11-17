@@ -83,6 +83,14 @@ inline bool serial_in_interrupt() {
     #endif
 }
 
+inline bool serial_host_connected() {
+    #if (defined(PICO_RP2040) || defined(PICO_RP2350)) && defined(USE_TINYUSB)
+        return Serial.dtr();
+    #else
+        return (bool)Serial;
+    #endif
+}
+
 struct SerialOutputStats {
     uint32_t dropped_bytes = 0;
     uint32_t short_writes = 0;
@@ -107,7 +115,7 @@ public:
     // Call once from core 0 before starting producers on other cores.
     void begin() {
         if (serial_in_interrupt() || !on_serial_core()) return;
-        const bool connected = (bool)Serial;
+        const bool connected = serial_host_connected();
         SerialOutputGuard guard(lock_);
         connected_ = connected;
     }
@@ -134,7 +142,9 @@ public:
             stats_.dropped_bytes += (uint32_t)(size - accepted);
             if (accepted != size) setWriteError();
         }
-        if (!serial_in_interrupt() && on_serial_core()) drain();
+        #if !defined(PICO_RP2040) && !defined(PICO_RP2350)
+            if (!serial_in_interrupt()) drain();
+        #endif
         return accepted;
     }
 
@@ -148,7 +158,7 @@ public:
     // Only transmit bytes the USB driver can currently accept without waiting.
     size_t drain(size_t budget = WRITE_CHUNK_SIZE) {
         if (serial_in_interrupt() || !on_serial_core()) return 0;
-        const bool connected = (bool)Serial;
+        const bool connected = serial_host_connected();
         {
             SerialOutputGuard guard(lock_);
             connected_ = connected;
@@ -156,6 +166,7 @@ public:
         if (!connected || !begin_wire()) return 0;
         size_t sent = report_errors(budget);
         if (report_offset_ != report_size_) {
+            kick_cdc(sent);
             end_wire();
             return sent;
         }
@@ -169,10 +180,10 @@ public:
                 if (pending_offset_ == pending_size_) {
                     pending_size_ = queued_ < WRITE_CHUNK_SIZE ? queued_ : WRITE_CHUNK_SIZE;
                     pending_offset_ = 0;
-                    for (size_t i = 0; i < pending_size_; ++i) {
-                        pending_[i] = queue_[head_];
-                        head_ = (head_ + 1) % QUEUE_CAPACITY;
-                    }
+                    const size_t first = pending_size_ < QUEUE_CAPACITY - head_ ? pending_size_ : QUEUE_CAPACITY - head_;
+                    std::memcpy(pending_, queue_ + head_, first);
+                    if (pending_size_ > first) std::memcpy(pending_ + first, queue_, pending_size_ - first);
+                    head_ = (head_ + pending_size_) % QUEUE_CAPACITY;
                     queued_ -= pending_size_;
                 }
                 count = pending_size_ - pending_offset_;
@@ -193,6 +204,7 @@ public:
             sent += written;
             if (!written) break;
         }
+        kick_cdc(sent);
         end_wire();
         return sent;
     }
@@ -204,6 +216,13 @@ public:
             if (connected()) Serial.flush();
             end_wire();
         }
+    }
+    static void kick_cdc(size_t sent) {
+        #if (defined(PICO_RP2040) || defined(PICO_RP2350)) && defined(USE_TINYUSB)
+        if (sent) Serial.flush();
+        #else
+        (void)sent;
+        #endif
     }
 
 private:
@@ -303,7 +322,7 @@ public:
         : output_(output), started_at_(millis()) {
         if (!serial_in_interrupt() && on_serial_core()) {
             output_.drain();
-            active_ = output_.begin_wire();
+            active_ = output_.connected() && output_.begin_wire();
         }
         if (!active_) {
             SerialOutputGuard guard(output_.lock_);
@@ -321,18 +340,28 @@ public:
 
     size_t write(uint8_t byte) override { return write(&byte, 1); }
     size_t write(const uint8_t* data, size_t size) override {
-        if (!active_ || !good_) return 0;
-        if (size >= SerialOutput::WRITE_CHUNK_SIZE) Serial.flush();
+        if (!active_ || !good_ || serial_in_interrupt() || !on_serial_core()) return 0;
+        #if !defined(PICO_RP2040) && !defined(PICO_RP2350)
+            if (size >= SerialOutput::WRITE_CHUNK_SIZE && serial_host_connected()) Serial.flush();
+        #endif
         size_t sent = 0;
         while (sent < size) {
-            if (!Serial || (uint32_t)(millis() - started_at_) >= 250) {
+            if (!serial_host_connected() || (uint32_t)(millis() - started_at_) >= 250) {
                 good_ = false;
                 setWriteError();
                 break;
             }
             const size_t remaining = size - sent;
-            const size_t count = remaining < SerialOutput::WRITE_CHUNK_SIZE
-                ? remaining : SerialOutput::WRITE_CHUNK_SIZE;
+            size_t count = remaining < SerialOutput::WRITE_CHUNK_SIZE ? remaining : SerialOutput::WRITE_CHUNK_SIZE;
+            #if defined(PICO_RP2040) || defined(PICO_RP2350)
+                const int available = Serial.availableForWrite();
+                if (available <= 0) {
+                    good_ = false;
+                    setWriteError();
+                    break;
+                }
+                if (count > (size_t)available) count = (size_t)available;
+            #endif
             const size_t written = Serial.write(data + sent, count);
             if (written < count) output_.note_short_write();
             sent += written;
@@ -350,8 +379,8 @@ public:
 
     bool finish() {
         if (!active_) return false;
-        if (!Serial) good_ = false;
-        if (good_ && Serial) Serial.flush();
+        good_ = good_ && !serial_in_interrupt() && on_serial_core() && serial_host_connected();
+        if (good_) Serial.flush();
         output_.end_packet(good_);
         active_ = false;
         return good_;

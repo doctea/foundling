@@ -18,8 +18,11 @@ never query the USB driver from a producer core.
 Text uses a fixed FIFO, 2 KiB by default. Set
 `FOUNDLING_SERIAL_QUEUE_CAPACITY` consistently across translation units to
 change its size. Each write is accepted in full or dropped in full when the
-queue lacks room. Writes outside a packet also attempt a bounded, non-waiting
-drain, but only on core 0; producers on other cores only enqueue text.
+queue lacks room. On RP2040/RP2350, all producers only enqueue and the core 0
+loop drains. With TinyUSB, the drain uses DTR to avoid a yielding connection
+check and kicks transfers for short writes. Other platforms retain their
+existing foreground drain-on-write behavior and depend on the serial driver's
+backpressure contract.
 
 On RP2040/RP2350, the queue uses a Pico SDK critical section, which combines a
 hardware spinlock with local interrupt masking. Host builds use a mutex, and
@@ -52,10 +55,12 @@ inside an interrupt handler or an interrupt-disabled critical section.
 Packet writes use chunks of at most 512 bytes, advance by the actual accepted
 byte count, and retry positive partial writes. Bulk chunks are flushed separately
 to avoid accumulating a multi-packet transfer in Teensy's 2 KiB transmit buffers.
-Zero writes, disconnection, or a
-250 ms packet deadline fail the packet; subsequent writes (including a trailer)
-are suppressed. The underlying driver's own blocking call can overshoot that
-deadline. Destruction releases the packet lock even if the sender exits early.
+Zero writes, disconnection, or a 250 ms packet deadline fail the packet;
+subsequent writes (including a trailer) are suppressed. On RP2040/RP2350 a
+packet also fails as soon as the TX FIFO is full rather than waiting for the
+host. A large viewer frame may therefore arrive incomplete. On Teensy, the
+driver's own blocking call can overshoot the packet deadline. Destruction
+releases the packet lock even if the sender exits early.
 `finish()` records successful acceptance by the driver, not acknowledgement by
 the host or proof of framebuffer consistency.
 
@@ -69,6 +74,22 @@ it does not wait indefinitely for a stalled host.
 **Direct `Serial.print/write/printf/flush` calls bypass this protection.**
 Projects should migrate relevant diagnostic producers to the shared macros;
 binary protocol output must use the packet API, not the text macros.
+
+## Retained warnings
+
+`Warn_printf`, `Warn_print`, and `Warn_println` emit text through the same
+wrappers. Define `ENABLE_WARNING_LOG` project-wide to also retain recent
+warnings in RAM, including when no host is connected. On multicore targets,
+call `foundling::warning_log()` before starting other producers. Use warnings
+for infrequent problems, not from interrupt or audio sample code. With retention
+enabled, interrupt warnings are ignored.
+
+The default is eight entries of 96 bytes each, including the terminator. Set
+`FOUNDLING_WARNING_LOG_CAPACITY` and `FOUNDLING_WARNING_MESSAGE_SIZE` to tune that
+cost. Messages that don't fit are truncated and new entries overwrite the oldest.
+Use `foundling::warning_log().size()` and `read(index, buffer)` (oldest first,
+with a `char[foundling::WarningLog::MESSAGE_SIZE]` buffer) to retrieve copies.
+The log is volatile; it isn't replayed on connection or written to flash.
 
 ## Tests
 

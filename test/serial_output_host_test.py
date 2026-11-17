@@ -52,6 +52,7 @@ struct FakeSerial {
     std::string data;
     std::function<void()> on_write;
     explicit operator bool() const { return connected; }
+    bool dtr() const { return connected; }
     int availableForWrite() const { return available; }
     size_t write(const uint8_t* bytes, size_t size) {
         largest_request = std::max(largest_request, size);
@@ -70,6 +71,7 @@ SOURCE = r'''
 #include <atomic>
 #include <thread>
 #define ENABLE_SERIAL_OUTPUT_QUEUE
+#define ENABLE_WARNING_LOG
 #define SERIAL_FLUSH_REALLY
 #include "shared_debug.h"
 
@@ -326,6 +328,25 @@ static void wrappers_share_one_queue_across_translation_units() {
     assert(Serial.data == "STARTENDpeer=7");
 }
 
+static void warnings_are_retained_offline_in_ring_order() {
+    reset_serial();
+    Serial.connected = false;
+    foundling::serial_output().begin();
+    auto& log = foundling::warning_log();
+    Warn_println("first offline warning");
+    char message[foundling::WarningLog::MESSAGE_SIZE];
+    assert(log.read(0, message));
+    assert(std::string(message) == "first offline warning\r\n");
+    for (size_t index = 0; index < log.CAPACITY; ++index) {
+        Warn_printf("offline-%u", (unsigned)index);
+    }
+    assert(log.size() == log.CAPACITY);
+    assert(log.read(0, message));
+    assert(std::string(message) == "offline-0");
+    assert(!log.read(log.CAPACITY, message));
+    assert(Serial.data.empty());
+}
+
 int main() {
     queued_logs_do_not_enter_packets();
     bulk_packets_are_complete_and_flushed_in_usb_sized_chunks();
@@ -338,15 +359,60 @@ int main() {
     concurrent_writers_preserve_each_write();
     nested_or_abandoned_packets_release_only_their_own_lock();
     wrappers_share_one_queue_across_translation_units();
-    std::puts("11 serial output behavior cases passed");
+    warnings_are_retained_offline_in_ring_order();
+    std::puts("12 serial output and warning behavior cases passed");
 }
 '''
 
 PEER = r'''
 #define ENABLE_SERIAL_OUTPUT_QUEUE
+#define ENABLE_WARNING_LOG
 #include "shared_debug.h"
 foundling::SerialOutput* peer_output() { return &foundling::serial_output(); }
 void peer_log() { Serial_printf("peer=%d", 7); }
+'''
+
+PICO_SOURCE = r'''
+#include <cassert>
+#define PICO_RP2040 1
+#define USE_TINYUSB
+#include "serial_output.h"
+
+FakeSerial Serial;
+uint32_t test_time = 0;
+unsigned test_core = 0;
+unsigned test_exception = 0;
+
+int main() {
+    foundling::SerialOutput output;
+    output.begin();
+    output.print("short");
+    assert(Serial.data.empty());
+    test_core = 1;
+    output.print(" core1");
+    assert(output.drain() == 0);
+    test_core = 0;
+    test_exception = 16;
+    output.print(" irq");
+    assert(output.drain() == 0);
+    test_exception = 0;
+    Serial.available = 0;
+    assert(output.drain() == 0);
+    assert(Serial.flushes == 0);
+    assert(Serial.largest_request == 0);
+    {
+        foundling::SerialPacket packet(output);
+        assert(packet.print("frame") == 0);
+        assert(!packet.finish());
+    }
+    assert(Serial.largest_request == 0);
+    Serial.available = 512;
+    output.drain();
+    assert(Serial.data.find("failed_packets=1") != std::string::npos);
+    assert(Serial.data.find("short core1 irq") != std::string::npos);
+    assert(Serial.flushes == 1);
+    std::puts("RP2 CDC ownership, full FIFO and short transfer kick passed");
+}
 '''
 
 
@@ -357,6 +423,22 @@ def main():
         (root / "Arduino.h").write_text(ARDUINO, encoding="utf-8")
         (root / "serial_test.cpp").write_text(SOURCE, encoding="utf-8")
         (root / "peer.cpp").write_text(PEER, encoding="utf-8")
+        (root / "rp2_test.cpp").write_text(PICO_SOURCE, encoding="utf-8")
+        (root / "pico").mkdir()
+        (root / "pico/critical_section.h").write_text(
+            "struct critical_section_t {};\n"
+            "inline void critical_section_init(critical_section_t*) {}\n"
+            "inline void critical_section_deinit(critical_section_t*) {}\n"
+            "inline void critical_section_enter_blocking(critical_section_t*) {}\n"
+            "inline void critical_section_exit(critical_section_t*) {}\n",
+            encoding="utf-8",
+        )
+        (root / "pico/platform.h").write_text(
+            "extern unsigned test_core, test_exception;\n"
+            "inline unsigned get_core_num() { return test_core; }\n"
+            "inline unsigned __get_current_exception() { return test_exception; }\n",
+            encoding="utf-8",
+        )
         if os.name == "nt":
             vcvars = os.environ.get(
                 "VCVARS64",
@@ -367,7 +449,8 @@ def main():
             command = (
                 f'call "{vcvars}" >nul && cl /nologo /std:c++14 /EHsc /W4 /WX '
                 f'/I"{root}" /I"{include}" serial_test.cpp peer.cpp /Fe:serial_test.exe '
-                f'&& serial_test.exe'
+                f'&& serial_test.exe && cl /nologo /std:c++14 /EHsc /W4 /WX '
+                f'/I"{root}" /I"{include}" rp2_test.cpp /Fe:rp2_test.exe && rp2_test.exe'
             )
             subprocess.run(
                 f'"{os.environ["COMSPEC"]}" /d /s /c "{command}"', cwd=root, check=True
@@ -381,6 +464,12 @@ def main():
                 str(root / "peer.cpp"), "-o", str(binary),
             ], check=True)
             subprocess.run([str(binary)], check=True)
+            rp2 = root / "rp2_test"
+            subprocess.run(compiler + [
+                "-std=c++11", "-Wall", "-Wextra", "-Werror",
+                f"-I{root}", f"-I{include}", str(root / "rp2_test.cpp"), "-o", str(rp2),
+            ], check=True)
+            subprocess.run([str(rp2)], check=True)
 
 
 if __name__ == "__main__":
