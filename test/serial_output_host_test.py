@@ -67,6 +67,8 @@ extern FakeSerial Serial;
 
 SOURCE = r'''
 #include <cassert>
+#include <atomic>
+#include <thread>
 #define ENABLE_SERIAL_OUTPUT_QUEUE
 #define SERIAL_FLUSH_REALLY
 #include "shared_debug.h"
@@ -168,11 +170,11 @@ static void deadline_and_disconnect_fail_without_trailers() {
 static void overflow_is_bounded_and_visible() {
     reset_serial();
     foundling::SerialOutput output;
-    std::vector<uint8_t> text(foundling::SerialOutput::QUEUE_CAPACITY, 'a');
+    std::vector<uint8_t> text(foundling::SerialOutput::QUEUE_CAPACITY - 2, 'a');
     {
         foundling::SerialPacket packet(output);
         assert(output.write(text.data(), text.size()) == text.size());
-        assert(output.print("xyz") == 0);
+        assert(output.write((const uint8_t*)"xyz", 3) == 0);
         assert(output.stats().dropped_bytes == 3);
         assert(output.getWriteError());
         packet.print("frame");
@@ -208,6 +210,78 @@ static void stalled_text_and_partial_diagnostics_are_preserved() {
     assert(Serial.data == "wait");
 }
 
+static void cached_connection_state_tracks_the_usb_driver() {
+    reset_serial();
+    Serial.connected = false;
+    foundling::SerialOutput& output = foundling::serial_output();
+    output.begin();
+    assert(!output.connected());
+    Serial_printf("hidden");
+    assert(Serial.data.empty());
+    Serial.connected = true;
+    assert(!output.connected());
+    output.drain();
+    assert(output.connected());
+    Serial_printf("visible");
+    assert(Serial.data == "visible");
+    Serial.connected = false;
+    output.drain();
+    assert(!output.connected());
+}
+
+static void concurrent_writers_preserve_each_write() {
+    reset_serial();
+    foundling::SerialOutput output;
+    const size_t thread_count = 4;
+    const size_t record_count = 200;
+    std::atomic<bool> start(false);
+    std::atomic<size_t> failures(0);
+    std::vector<std::thread> writers;
+    writers.reserve(thread_count);
+    for (size_t thread_id = 0; thread_id < thread_count; ++thread_id) {
+        writers.emplace_back([&, thread_id] {
+            while (!start.load()) std::this_thread::yield();
+            for (size_t record_id = 0; record_id < record_count; ++record_id) {
+                char record[16];
+                const int length = std::snprintf(record, sizeof(record), "%u:%04u\n",
+                    (unsigned)thread_id, (unsigned)record_id);
+                if (length <= 0 ||
+                    output.write((const uint8_t*)record, (size_t)length) != (size_t)length) {
+                    ++failures;
+                }
+            }
+        });
+    }
+    start.store(true);
+    for (auto& writer : writers) writer.join();
+    for (int i = 0; i < 1000 && output.stats().queued_bytes; ++i) output.drain();
+
+    assert(failures.load() == 0);
+    assert(output.stats().queued_bytes == 0);
+    assert(Serial.data.size() == thread_count * record_count * 7);
+    bool seen[4][200] = {};
+    for (size_t offset = 0; offset < Serial.data.size(); offset += 7) {
+        const char* record = Serial.data.data() + offset;
+        assert(record[0] >= '0' && record[0] <= '3');
+        assert(record[1] == ':');
+        assert(record[6] == '\n');
+        unsigned value = 0;
+        for (size_t digit = 2; digit < 6; ++digit) {
+            assert(record[digit] >= '0' && record[digit] <= '9');
+            value = value * 10 + (unsigned)(record[digit] - '0');
+        }
+        const size_t thread_id = (size_t)(record[0] - '0');
+        assert(value < record_count);
+        assert(!seen[thread_id][value]);
+        seen[thread_id][value] = true;
+    }
+    for (size_t thread_id = 0; thread_id < thread_count; ++thread_id) {
+        for (size_t record_id = 0; record_id < record_count; ++record_id) {
+            assert(seen[thread_id][record_id]);
+        }
+    }
+}
+
 static void nested_or_abandoned_packets_release_only_their_own_lock() {
     reset_serial();
     foundling::SerialOutput output;
@@ -237,6 +311,7 @@ static void nested_or_abandoned_packets_release_only_their_own_lock() {
 
 static void wrappers_share_one_queue_across_translation_units() {
     reset_serial();
+    foundling::serial_output().begin();
     assert(peer_output() == &foundling::serial_output());
     {
         foundling::SerialPacket packet;
@@ -259,9 +334,11 @@ int main() {
     deadline_and_disconnect_fail_without_trailers();
     overflow_is_bounded_and_visible();
     stalled_text_and_partial_diagnostics_are_preserved();
+    cached_connection_state_tracks_the_usb_driver();
+    concurrent_writers_preserve_each_write();
     nested_or_abandoned_packets_release_only_their_own_lock();
     wrappers_share_one_queue_across_translation_units();
-    std::puts("9 serial output behavior cases passed");
+    std::puts("11 serial output behavior cases passed");
 }
 '''
 
@@ -300,7 +377,7 @@ def main():
             binary = root / "serial_test"
             subprocess.run(compiler + [
                 "-std=c++11", "-Wall", "-Wextra", "-Werror",
-                f"-I{root}", f"-I{include}", str(root / "serial_test.cpp"),
+                "-pthread", f"-I{root}", f"-I{include}", str(root / "serial_test.cpp"),
                 str(root / "peer.cpp"), "-o", str(binary),
             ], check=True)
             subprocess.run([str(binary)], check=True)

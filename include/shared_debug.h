@@ -18,19 +18,21 @@ int freeRam();
 #ifdef ENABLE_SERIAL_OUTPUT_QUEUE
     #include "serial_output.h"
     #define FOUNDLING_SERIAL_OUTPUT foundling::serial_output()
+    #define FOUNDLING_SERIAL_CONNECTED FOUNDLING_SERIAL_OUTPUT.connected()
 #else
     #define FOUNDLING_SERIAL_OUTPUT Serial
+    #define FOUNDLING_SERIAL_CONNECTED Serial
 #endif
 
 #ifndef Serial_println
-    #define Serial_println(X)   do { if(Serial) FOUNDLING_SERIAL_OUTPUT.println(X); } while (0)
-    #define Serial_printf(...) do { if(Serial) FOUNDLING_SERIAL_OUTPUT.printf(__VA_ARGS__); } while (0)
-    #define Serial_print(X)     do { if(Serial) FOUNDLING_SERIAL_OUTPUT.print(X); } while (0)
+    #define Serial_println(X)   do { if(FOUNDLING_SERIAL_CONNECTED) FOUNDLING_SERIAL_OUTPUT.println(X); } while (0)
+    #define Serial_printf(...) do { if(FOUNDLING_SERIAL_CONNECTED) FOUNDLING_SERIAL_OUTPUT.printf(__VA_ARGS__); } while (0)
+    #define Serial_print(X)     do { if(FOUNDLING_SERIAL_CONNECTED) FOUNDLING_SERIAL_OUTPUT.print(X); } while (0)
 #endif
 
 #ifndef Serial_flush
     #ifdef SERIAL_FLUSH_REALLY
-        #define Serial_flush() do { if(Serial) FOUNDLING_SERIAL_OUTPUT.flush(); } while (0)
+        #define Serial_flush() do { if(FOUNDLING_SERIAL_CONNECTED) FOUNDLING_SERIAL_OUTPUT.flush(); } while (0)
     #else
         #define Serial_flush() {}
     #endif

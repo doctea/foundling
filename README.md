@@ -7,18 +7,30 @@ to route these macros through `foundling::serial_output()`. Without it, their
 existing direct-Serial behavior is retained.
 
 The shared output object derives from Arduino `Print`, so normal values, flash
-strings, and the platform's `printf` support remain available. Initialize it
-from setup before enabling interrupt producers, and call
-`foundling::serial_output().drain()` each loop.
+strings, and the platform's `printf` support remain available. Call
+`foundling::serial_output().begin()` from core 0 before enabling producers on
+other cores, and call `foundling::serial_output().drain()` from core 0's loop.
+The wrappers use the connection state cached by `begin()` and `drain()`; they
+never query the USB driver from a producer core.
 
 ## Text and binary packets
 
-Text uses a fixed 2 KiB FIFO. Writes outside a packet also attempt a bounded,
-non-waiting drain. During a packet, text is only queued: even a wrapper flush
-cannot write into the packet. Interrupt-state preservation and interrupt-context
-detection are provided for single-core Cortex-M targets, including Teensy 4.x.
-On other architectures, use these APIs only from main context until equivalent
-interrupt guards are supplied. This is not a multicore synchronization primitive.
+Text uses a fixed FIFO, 2 KiB by default. Set
+`FOUNDLING_SERIAL_QUEUE_CAPACITY` consistently across translation units to
+change its size. Each write is accepted in full or dropped in full when the
+queue lacks room. Writes outside a packet also attempt a bounded, non-waiting
+drain, but only on core 0; producers on other cores only enqueue text.
+
+On RP2040/RP2350, the queue uses a Pico SDK critical section, which combines a
+hardware spinlock with local interrupt masking. Host builds use a mutex, and
+single-core Cortex-M targets retain interrupt masking. Call `begin()` before
+starting producers on other cores so the queue and its lock are initialized
+before concurrent use. This protects the queue; it does not make arbitrary
+application state or the USB driver safe to access from multiple cores.
+
+During a packet, text is only queued: even a wrapper flush cannot write into
+the packet. `SerialPacket` must be created and written from core 0 in normal
+main context with interrupts enabled.
 
 Use `foundling::SerialPacket` for binary framing:
 

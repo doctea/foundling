@@ -3,30 +3,78 @@
 #include <Arduino.h>
 #include <cstring>
 
+#if defined(PICO_RP2040) || defined(PICO_RP2350)
+    #include <pico/critical_section.h>
+    #include <pico/platform.h>
+#elif !defined(ARDUINO)
+    #include <mutex>
+#endif
+
+#ifndef FOUNDLING_SERIAL_QUEUE_CAPACITY
+    #define FOUNDLING_SERIAL_QUEUE_CAPACITY 2048
+#endif
+
 namespace foundling {
 
-class SerialInterruptGuard {
+class SerialOutputLock {
 public:
-    SerialInterruptGuard() {
-        #if defined(__arm__) || defined(__thumb__)
-        asm volatile("mrs %0, primask\ncpsid i" : "=r"(state_) :: "memory");
+    SerialOutputLock() {
+        #if defined(PICO_RP2040) || defined(PICO_RP2350)
+            critical_section_init(&section_);
         #endif
     }
-    ~SerialInterruptGuard() {
-        #if defined(__arm__) || defined(__thumb__)
-        asm volatile("msr primask, %0" :: "r"(state_) : "memory");
+    ~SerialOutputLock() {
+        #if defined(PICO_RP2040) || defined(PICO_RP2350)
+            critical_section_deinit(&section_);
         #endif
     }
-    SerialInterruptGuard(const SerialInterruptGuard&) = delete;
-    SerialInterruptGuard& operator=(const SerialInterruptGuard&) = delete;
+    SerialOutputLock(const SerialOutputLock&) = delete;
+    SerialOutputLock& operator=(const SerialOutputLock&) = delete;
+
 private:
-    #if defined(__arm__) || defined(__thumb__)
-    uint32_t state_;
+    friend class SerialOutputGuard;
+    #if defined(PICO_RP2040) || defined(PICO_RP2350)
+        critical_section_t section_{};
+    #elif !defined(ARDUINO)
+        std::mutex mutex_;
+    #endif
+};
+
+class SerialOutputGuard {
+public:
+    explicit SerialOutputGuard(SerialOutputLock& lock) : lock_(lock) {
+        #if defined(PICO_RP2040) || defined(PICO_RP2350)
+            critical_section_enter_blocking(&lock_.section_);
+        #elif defined(__arm__) || defined(__thumb__)
+            asm volatile("mrs %0, primask\ncpsid i" : "=r"(state_) :: "memory");
+        #elif !defined(ARDUINO)
+            lock_.mutex_.lock();
+        #endif
+    }
+    ~SerialOutputGuard() {
+        #if defined(PICO_RP2040) || defined(PICO_RP2350)
+            critical_section_exit(&lock_.section_);
+        #elif defined(__arm__) || defined(__thumb__)
+            asm volatile("msr primask, %0" :: "r"(state_) : "memory");
+        #elif !defined(ARDUINO)
+            lock_.mutex_.unlock();
+        #endif
+    }
+    SerialOutputGuard(const SerialOutputGuard&) = delete;
+    SerialOutputGuard& operator=(const SerialOutputGuard&) = delete;
+private:
+    SerialOutputLock& lock_;
+    #if defined(__arm__) && !defined(PICO_RP2040) && !defined(PICO_RP2350)
+        uint32_t state_;
+    #elif defined(__thumb__) && !defined(PICO_RP2040) && !defined(PICO_RP2350)
+        uint32_t state_;
     #endif
 };
 
 inline bool serial_in_interrupt() {
-    #if defined(__arm__) || defined(__thumb__)
+    #if defined(PICO_RP2040) || defined(PICO_RP2350)
+    return __get_current_exception() != 0;
+    #elif defined(__arm__) || defined(__thumb__)
     uint32_t state;
     asm volatile("mrs %0, ipsr" : "=r"(state));
     return state != 0;
@@ -47,31 +95,51 @@ class SerialPacket;
 
 class SerialOutput : public Print {
 public:
-    static constexpr size_t QUEUE_CAPACITY = 2048;
+    static constexpr size_t QUEUE_CAPACITY = FOUNDLING_SERIAL_QUEUE_CAPACITY;
     static constexpr size_t WRITE_CHUNK_SIZE = 512;
+    static_assert(QUEUE_CAPACITY > 0, "serial output queue capacity must be positive");
     using Print::write;
+
+    SerialOutput() = default;
+    SerialOutput(const SerialOutput&) = delete;
+    SerialOutput& operator=(const SerialOutput&) = delete;
+
+    // Call once from core 0 before starting producers on other cores.
+    void begin() {
+        if (serial_in_interrupt() || !on_serial_core()) return;
+        const bool connected = (bool)Serial;
+        SerialOutputGuard guard(lock_);
+        connected_ = connected;
+    }
+
+    bool connected() const {
+        SerialOutputGuard guard(lock_);
+        return connected_;
+    }
 
     size_t write(uint8_t byte) override { return write(&byte, 1); }
 
     size_t write(const uint8_t* data, size_t size) override {
         size_t accepted;
         {
-            SerialInterruptGuard guard;
-            accepted = size < QUEUE_CAPACITY - queued_ ? size : QUEUE_CAPACITY - queued_;
-            const size_t first = accepted < QUEUE_CAPACITY - tail_ ? accepted : QUEUE_CAPACITY - tail_;
-            if (first) std::memcpy(queue_ + tail_, data, first);
-            if (accepted > first) std::memcpy(queue_, data + first, accepted - first);
-            tail_ = (tail_ + accepted) % QUEUE_CAPACITY;
-            queued_ += accepted;
+            SerialOutputGuard guard(lock_);
+            accepted = size <= QUEUE_CAPACITY - queued_ ? size : 0;
+            if (accepted) {
+                const size_t first = accepted < QUEUE_CAPACITY - tail_ ? accepted : QUEUE_CAPACITY - tail_;
+                std::memcpy(queue_ + tail_, data, first);
+                if (accepted > first) std::memcpy(queue_, data + first, accepted - first);
+                tail_ = (tail_ + accepted) % QUEUE_CAPACITY;
+                queued_ += accepted;
+            }
             stats_.dropped_bytes += (uint32_t)(size - accepted);
             if (accepted != size) setWriteError();
         }
-        if (!serial_in_interrupt()) drain();
+        if (!serial_in_interrupt() && on_serial_core()) drain();
         return accepted;
     }
 
     SerialOutputStats stats() const {
-        SerialInterruptGuard guard;
+        SerialOutputGuard guard(lock_);
         SerialOutputStats result = stats_;
         result.queued_bytes = queued_ + pending_size_ - pending_offset_;
         return result;
@@ -79,7 +147,13 @@ public:
 
     // Only transmit bytes the USB driver can currently accept without waiting.
     size_t drain(size_t budget = WRITE_CHUNK_SIZE) {
-        if (serial_in_interrupt() || !Serial || !begin_wire()) return 0;
+        if (serial_in_interrupt() || !on_serial_core()) return 0;
+        const bool connected = (bool)Serial;
+        {
+            SerialOutputGuard guard(lock_);
+            connected_ = connected;
+        }
+        if (!connected || !begin_wire()) return 0;
         size_t sent = report_errors(budget);
         if (report_offset_ != report_size_) {
             end_wire();
@@ -88,23 +162,34 @@ public:
         while (sent < budget) {
             const int available = Serial.availableForWrite();
             if (available <= 0) break;
-            if (pending_offset_ == pending_size_) {
-                SerialInterruptGuard guard;
-                pending_size_ = queued_ < WRITE_CHUNK_SIZE ? queued_ : WRITE_CHUNK_SIZE;
-                pending_offset_ = 0;
-                for (size_t i = 0; i < pending_size_; ++i) {
-                    pending_[i] = queue_[head_];
-                    head_ = (head_ + 1) % QUEUE_CAPACITY;
+            size_t count;
+            const uint8_t* data;
+            {
+                SerialOutputGuard guard(lock_);
+                if (pending_offset_ == pending_size_) {
+                    pending_size_ = queued_ < WRITE_CHUNK_SIZE ? queued_ : WRITE_CHUNK_SIZE;
+                    pending_offset_ = 0;
+                    for (size_t i = 0; i < pending_size_; ++i) {
+                        pending_[i] = queue_[head_];
+                        head_ = (head_ + 1) % QUEUE_CAPACITY;
+                    }
+                    queued_ -= pending_size_;
                 }
-                queued_ -= pending_size_;
+                count = pending_size_ - pending_offset_;
+                if (count > budget - sent) count = budget - sent;
+                if (count > (size_t)available) count = (size_t)available;
+                data = pending_ + pending_offset_;
             }
-            if (!pending_size_) break;
-            size_t count = pending_size_ - pending_offset_;
-            if (count > budget - sent) count = budget - sent;
-            if (count > (size_t)available) count = (size_t)available;
-            const size_t written = Serial.write(pending_ + pending_offset_, count);
-            if (written < count) note_short_write();
-            pending_offset_ += written;
+            if (!count) break;
+            const size_t written = Serial.write(data, count);
+            {
+                SerialOutputGuard guard(lock_);
+                if (written < count) {
+                    ++stats_.short_writes;
+                    setWriteError();
+                }
+                pending_offset_ += written;
+            }
             sent += written;
             if (!written) break;
         }
@@ -113,33 +198,41 @@ public:
     }
 
     void flush() override {
-        if (serial_in_interrupt()) return;
+        if (serial_in_interrupt() || !on_serial_core()) return;
         drain(QUEUE_CAPACITY);
         if (begin_wire()) {
-            if (Serial) Serial.flush();
+            if (connected()) Serial.flush();
             end_wire();
         }
     }
 
 private:
+    static bool on_serial_core() {
+        #if defined(PICO_RP2040) || defined(PICO_RP2350)
+            return get_core_num() == 0;
+        #else
+            return true;
+        #endif
+    }
+
     friend class SerialPacket;
     bool begin_wire() {
-        SerialInterruptGuard guard;
+        SerialOutputGuard guard(lock_);
         if (wire_busy_) return false;
         wire_busy_ = true;
         return true;
     }
     void end_wire() {
-        SerialInterruptGuard guard;
+        SerialOutputGuard guard(lock_);
         wire_busy_ = false;
     }
     void note_short_write() {
-        SerialInterruptGuard guard;
+        SerialOutputGuard guard(lock_);
         ++stats_.short_writes;
         setWriteError();
     }
     void end_packet(bool completed) {
-        SerialInterruptGuard guard;
+        SerialOutputGuard guard(lock_);
         if (completed) ++stats_.packets_completed;
         else {
             ++stats_.packets_failed;
@@ -167,16 +260,21 @@ private:
         if (count > (size_t)available) count = (size_t)available;
         const size_t written = Serial.write((const uint8_t*)report_ + report_offset_, count);
         report_offset_ += written;
-        if (written < count) setWriteError();
         if (report_offset_ == report_size_) {
             reported_dropped_ = report_stats_.dropped_bytes;
             reported_short_ = report_stats_.short_writes;
             reported_failed_ = report_stats_.packets_failed;
         }
+        if (written < count) {
+            SerialOutputGuard guard(lock_);
+            setWriteError();
+        }
         return written;
     }
 
+    mutable SerialOutputLock lock_;
     bool wire_busy_ = false;
+    bool connected_ = false;
     uint8_t queue_[QUEUE_CAPACITY] = {};
     size_t head_ = 0;
     size_t tail_ = 0;
@@ -203,12 +301,12 @@ class SerialPacket : public Print {
 public:
     explicit SerialPacket(SerialOutput& output = serial_output())
         : output_(output), started_at_(millis()) {
-        if (!serial_in_interrupt()) {
+        if (!serial_in_interrupt() && on_serial_core()) {
             output_.drain();
             active_ = output_.begin_wire();
         }
         if (!active_) {
-            SerialInterruptGuard guard;
+            SerialOutputGuard guard(output_.lock_);
             ++output_.stats_.packets_failed;
             setWriteError();
         }
@@ -260,6 +358,14 @@ public:
     }
 
 private:
+    static bool on_serial_core() {
+        #if defined(PICO_RP2040) || defined(PICO_RP2350)
+            return get_core_num() == 0;
+        #else
+            return true;
+        #endif
+    }
+
     SerialOutput& output_;
     uint32_t started_at_;
     bool active_ = false;
