@@ -10,8 +10,11 @@ The shared output object derives from Arduino `Print`, so normal values, flash
 strings, and the platform's `printf` support remain available. Call
 `foundling::serial_output().begin()` from core 0 before enabling producers on
 other cores, and call `foundling::serial_output().drain()` from core 0's loop.
-The wrappers use the connection state cached by `begin()` and `drain()`; they
-never query the USB driver from a producer core.
+The wrappers refresh the connection state in foreground code on core 0, so a
+host connecting during setup receives subsequent startup diagnostics even
+before the first loop drain. Interrupts and secondary cores use the cached
+state from `begin()`, `drain()`, or a foreground wrapper call; they never query
+the USB driver. Text emitted while disconnected is not retained by the wrappers.
 
 ## Text and binary packets
 

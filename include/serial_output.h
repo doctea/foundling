@@ -121,6 +121,13 @@ public:
     }
 
     bool connected() const {
+        // Setup may run for seconds before the first loop drain.
+        if (!serial_in_interrupt() && on_serial_core()) {
+            const bool connected = serial_host_connected();
+            SerialOutputGuard guard(lock_);
+            connected_ = connected;
+            return connected;
+        }
         SerialOutputGuard guard(lock_);
         return connected_;
     }
@@ -293,7 +300,7 @@ private:
 
     mutable SerialOutputLock lock_;
     bool wire_busy_ = false;
-    bool connected_ = false;
+    mutable bool connected_ = false;
     uint8_t queue_[QUEUE_CAPACITY] = {};
     size_t head_ = 0;
     size_t tail_ = 0;

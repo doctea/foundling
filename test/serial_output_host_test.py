@@ -45,14 +45,15 @@ private:
 
 struct FakeSerial {
     bool connected = true;
+    mutable unsigned connection_checks = 0;
     int available = 512;
     size_t maximum_write = 512;
     size_t largest_request = 0;
     size_t flushes = 0;
     std::string data;
     std::function<void()> on_write;
-    explicit operator bool() const { return connected; }
-    bool dtr() const { return connected; }
+    explicit operator bool() const { ++connection_checks; return connected; }
+    bool dtr() const { ++connection_checks; return connected; }
     int availableForWrite() const { return available; }
     size_t write(const uint8_t* bytes, size_t size) {
         largest_request = std::max(largest_request, size);
@@ -212,7 +213,7 @@ static void stalled_text_and_partial_diagnostics_are_preserved() {
     assert(Serial.data == "wait");
 }
 
-static void cached_connection_state_tracks_the_usb_driver() {
+static void startup_wrappers_notice_connection_without_loop_drain() {
     reset_serial();
     Serial.connected = false;
     foundling::SerialOutput& output = foundling::serial_output();
@@ -221,14 +222,17 @@ static void cached_connection_state_tracks_the_usb_driver() {
     Serial_printf("hidden");
     assert(Serial.data.empty());
     Serial.connected = true;
-    assert(!output.connected());
-    output.drain();
-    assert(output.connected());
     Serial_printf("visible");
     assert(Serial.data == "visible");
+    assert(output.connected());
     Serial.connected = false;
-    output.drain();
+    Serial_printf("hidden again");
     assert(!output.connected());
+    assert(Serial.data == "visible");
+    assert(output.stats().queued_bytes == 0);
+    Serial.connected = true;
+    Serial_println("reconnected");
+    assert(Serial.data == "visiblereconnected\r\n");
 }
 
 static void concurrent_writers_preserve_each_write() {
@@ -355,7 +359,7 @@ int main() {
     deadline_and_disconnect_fail_without_trailers();
     overflow_is_bounded_and_visible();
     stalled_text_and_partial_diagnostics_are_preserved();
-    cached_connection_state_tracks_the_usb_driver();
+    startup_wrappers_notice_connection_without_loop_drain();
     concurrent_writers_preserve_each_write();
     nested_or_abandoned_packets_release_only_their_own_lock();
     wrappers_share_one_queue_across_translation_units();
@@ -376,7 +380,8 @@ PICO_SOURCE = r'''
 #include <cassert>
 #define PICO_RP2040 1
 #define USE_TINYUSB
-#include "serial_output.h"
+#define ENABLE_SERIAL_OUTPUT_QUEUE
+#include "shared_debug.h"
 
 FakeSerial Serial;
 uint32_t test_time = 0;
@@ -411,6 +416,39 @@ int main() {
     assert(Serial.data.find("failed_packets=1") != std::string::npos);
     assert(Serial.data.find("short core1 irq") != std::string::npos);
     assert(Serial.flushes == 1);
+    Serial = FakeSerial();
+    Serial.connected = false;
+    auto& shared = foundling::serial_output();
+    shared.begin();
+    Serial.connected = true;
+    const unsigned checks = Serial.connection_checks;
+    test_core = 1;
+    Serial_printf("hidden core1");
+    assert(!shared.connected());
+    test_core = 0;
+    test_exception = 16;
+    Serial_printf("hidden irq");
+    assert(!shared.connected());
+    assert(Serial.connection_checks == checks);
+    test_exception = 0;
+    Serial_printf("startup");
+    assert(shared.connected());
+    assert(shared.stats().queued_bytes == 7);
+    Serial.connected = false;
+    const unsigned connected_checks = Serial.connection_checks;
+    test_exception = 16;
+    assert(shared.connected());
+    test_exception = 0;
+    test_core = 1;
+    assert(shared.connected());
+    assert(Serial.connection_checks == connected_checks);
+    test_core = 0;
+    Serial_printf("hidden disconnected");
+    assert(!shared.connected());
+    assert(shared.stats().queued_bytes == 7);
+    Serial.connected = true;
+    shared.drain();
+    assert(Serial.data == "startup");
     std::puts("RP2 CDC ownership, full FIFO and short transfer kick passed");
 }
 '''
